@@ -299,7 +299,7 @@ void __fini_adc(struct adc_conf* adc)
     }
 }
 
-void read_adc(int* ch0, int* ch1)
+void read_adc(int reps, int light_sleep, int* ch0, int* ch1)
 {
     static struct adc_conf* adc = NULL;
     int i;
@@ -319,7 +319,7 @@ void read_adc(int* ch0, int* ch1)
         adc = NULL;
     }
 
-    for (i = 0; i < 50; i++)
+    for (i = 0; i < reps; i++)
     {
         int adc_raw;
         int voltage;
@@ -371,15 +371,24 @@ void read_adc(int* ch0, int* ch1)
                 v1 += adc_raw;
             }
         }
+        // sleep for 10ms
+        if (light_sleep)
+        {
+            light_usleep(10000);
+        }
+        else
+        {
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
     }
     if (ch0)
     {
-        v0 /= i;
+        v0 /= reps;
         *ch0 = v0;
     }
     if (ch1)
     {
-        v1 /= i;
+        v1 /= reps;
         *ch1 = v1;
     }
 }
@@ -512,7 +521,7 @@ void ledc_pwm_fini(int led, int idle)
 void set_led_duty(int led, int duty)
 {
     duty = ((1 << 13) - 1) * duty / 1000;
-    printf("duty: %d\n", duty);
+    // printf("duty: %d\n", duty);
     ledc_set_duty(LEDC_MODE, led_to_channel[led], duty);
     ledc_update_duty(LEDC_MODE, led_to_channel[led]);
 }
@@ -521,12 +530,12 @@ int flame_to_led(const UBaseType_t* wait_on)
 {
     int flame_v = 0;
     ledc_pwm_init(RED_LED);
-    int finder_timeout = 100;
+    int finder_timeout = 20;
     while (--finder_timeout)
     {
-        for (int j = 0; j < 100; j++)
+        for (int j = 0; j < 20; j++)
         {
-            read_adc(&flame_v, NULL);
+            read_adc(5, 0, &flame_v, NULL);
             int duty = MIN(flame_v / 28, 100) * 10;
             //    printf("flame_v = %d, duty = %d.%d\n", flame_v, duty / 10,
             //           duty % 10);
@@ -593,12 +602,16 @@ void app_main(void)
         low_bat_count = -NOTIFY_LIMIT;
         memset(&flame_v_ave, 0, sizeof(flame_v_ave));
         memset(&batt_v_ave, 0, sizeof(batt_v_ave));
+        // at first boot, do a flame_to_led for proof of life and
+        // ease of programming (a good time with no deep or light sleeps)
+        flame_to_led(NULL);
     }
 
     const int NO_FLAME_MARK = 3;
     int flame_v = 0;
     int batt_v = 0;
-    read_adc(&flame_v, &batt_v);
+    // monitor the flame for a full second, with light sleep enabled
+    read_adc(100, 1, &flame_v, &batt_v);
     ave_new_value_limited(&batt_v_ave, batt_v);
     ESP_LOGI(TAG, "read_adc -> flame_v = %d, batt_v = %d (%d)\n", flame_v,
              batt_v, ave_val(&batt_v_ave));
