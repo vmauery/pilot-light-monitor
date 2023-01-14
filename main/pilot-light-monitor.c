@@ -68,24 +68,38 @@ void light_usleep(uint64_t us)
     esp_light_sleep_start();
 }
 
+void deep_usleep(uint64_t us)
+{
+    // All the work is done; go to sleep
+    ESP_LOGI(TAG, "Enabling timer wakeup, %dus\n", (int)(us / 1000000));
+    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(us));
+
+    ESP_LOGI(TAG, "Entering deep sleep\n");
+    uart_wait_tx_idle_polling(CONFIG_ESP_CONSOLE_UART_NUM);
+
+    esp_deep_sleep_start();
+}
+
+const int FLAME_OFF_MARK = 6;
+const int FLAME_ON_MARK = 8;
+
 #define RED_LED GPIO_NUM_6
 #define GREEN_LED GPIO_NUM_7
 
-#define WINDOW_SIZE 16
-#define FIXED_POINT 1000
+#define FIXED_POINT 1024
 struct windowed_ave
 {
     int value;
     int count;
+    int window;
 };
 
-static RTC_DATA_ATTR struct timeval sleep_enter_time;
 static RTC_DATA_ATTR int sleep_count;
 
 static RTC_DATA_ATTR int low_bat_count;
 static RTC_DATA_ATTR struct windowed_ave batt_v_ave;
 
-static RTC_DATA_ATTR int flame_out_count;
+static RTC_DATA_ATTR int pilot_light_out;
 static RTC_DATA_ATTR struct windowed_ave flame_v_ave;
 
 static RTC_DATA_ATTR int wake_count;
@@ -441,21 +455,45 @@ void register_timer_wakeup(void)
     ESP_LOGI(TAG, "timer wakeup source is ready");
 }
 
+void windowed_ave_init(struct windowed_ave* a, int window)
+{
+    a->count = 0;
+    a->value = 0;
+    a->window = window;
+}
+
 void ave_new_value_limited(struct windowed_ave* a, int val)
 {
-    int prev_count = (a->count == WINDOW_SIZE) ? (WINDOW_SIZE - 1) : a->count;
+    int prev_count = (a->count == a->window) ? (a->window - 1) : a->count;
     a->count = prev_count + 1;
-    int new_val = (prev_count * a->value + FIXED_POINT * val) / a->count;
-    if ((a->count == WINDOW_SIZE) && (new_val > a->value))
+    val *= FIXED_POINT;
+    int delta = val - a->value;
+    int sign = delta >= 0 ? 1 : -1;
+    delta = abs(delta);
+    int ok_delta = abs(a->value / (a->window / 2));
+    if ((a->count == a->window) && (delta > ok_delta))
     {
-        new_val = a->value;
+        // allow the growth to happen slowly
+        val = a->value + sign * ok_delta;
     }
-    a->value = new_val;
+    a->value = (prev_count * a->value + val) / a->count;
 }
+// return the closest integer to the average
 int ave_val(struct windowed_ave* a)
 {
     // integer rounding to nearest value
     return (a->value + FIXED_POINT / 2) / FIXED_POINT;
+}
+// return the whole part of the average
+static inline int ave_whole(struct windowed_ave* a)
+{
+    // integer division with truncation
+    return a->value / FIXED_POINT;
+}
+static inline int ave_millis(struct windowed_ave* a)
+{
+    // integer rounding to nearest value
+    return (1000 * (a->value % FIXED_POINT)) / FIXED_POINT;
 }
 
 void send_sms(const char* to, const char* msg)
@@ -526,11 +564,12 @@ void set_led_duty(int led, int duty)
     ledc_update_duty(LEDC_MODE, led_to_channel[led]);
 }
 
-int flame_to_led(const UBaseType_t* wait_on)
+// timeout is approximately seconds, wait on is a notify identifier
+int flame_to_led(int timeout, const UBaseType_t* wait_on)
 {
     int flame_v = 0;
     ledc_pwm_init(RED_LED);
-    int finder_timeout = 20;
+    int finder_timeout = timeout;
     while (--finder_timeout)
     {
         for (int j = 0; j < 20; j++)
@@ -549,7 +588,7 @@ int flame_to_led(const UBaseType_t* wait_on)
             }
         }
     }
-    ledc_pwm_fini(RED_LED, (flame_v > 15) ? 0 : 1);
+    ledc_pwm_fini(RED_LED, (flame_v > FLAME_OFF_MARK) ? 0 : 1);
 
     // return 1 for did not timeout, 0 for did timeout
     return finder_timeout ? 1 : 0;
@@ -557,16 +596,21 @@ int flame_to_led(const UBaseType_t* wait_on)
 
 void app_main(void)
 {
+    // device wakes up every wakeup_time_sec seconds, but only
+    // brings up the network and reports every
+    // wakeup_time_sec * report_tick_interval seconds
+    // Ideally this would be every 30 minutes
+
     // for debugging, 20 is nice, but 60 is better for the battery
     const int wakeup_time_sec = 20;
+    // for debugging, 5 is nice, but 30 is better for the battery
+    const int report_tick_interval = 5;
 
     // get task ID for notifications
     xMainTask = xTaskGetCurrentTaskHandle();
 
     struct timeval now;
     gettimeofday(&now, NULL);
-    int sleep_time_ms = (now.tv_sec - sleep_enter_time.tv_sec) * 1000 +
-                        (now.tv_usec - sleep_enter_time.tv_usec) / 1000;
 
     int wkup_cause = esp_sleep_get_wakeup_cause();
     printf("wakeup cause: 0x%x\n", wkup_cause);
@@ -574,9 +618,7 @@ void app_main(void)
     {
         case ESP_SLEEP_WAKEUP_TIMER:
         {
-            ESP_LOGI(TAG,
-                     "Wake up from timer. Time spent in deep sleep: %dms\n",
-                     sleep_time_ms);
+            ESP_LOGI(TAG, "Wake up from timer.\n");
             break;
         }
 
@@ -598,42 +640,51 @@ void app_main(void)
     int tick = sleep_count++;
     if (tick == 0)
     {
-        flame_out_count = -NOTIFY_LIMIT;
+        pilot_light_out = 1;
         low_bat_count = -NOTIFY_LIMIT;
-        memset(&flame_v_ave, 0, sizeof(flame_v_ave));
-        memset(&batt_v_ave, 0, sizeof(batt_v_ave));
+        windowed_ave_init(&flame_v_ave, 8);
+        windowed_ave_init(&batt_v_ave, 32);
         // at first boot, do a flame_to_led for proof of life and
         // ease of programming (a good time with no deep or light sleeps)
-        flame_to_led(NULL);
+        flame_to_led(10, NULL);
     }
 
-    const int NO_FLAME_MARK = 3;
     int flame_v = 0;
     int batt_v = 0;
     // monitor the flame for a full second, with light sleep enabled
     read_adc(100, 1, &flame_v, &batt_v);
+    ave_new_value_limited(&flame_v_ave, flame_v);
     ave_new_value_limited(&batt_v_ave, batt_v);
     ESP_LOGI(TAG, "read_adc -> flame_v = %d, batt_v = %d (%d)\n", flame_v,
              batt_v, ave_val(&batt_v_ave));
-    // full-burner =~ 1600-1800, pilot =~ 15-22, off =~ 0-5
-    int pilot_light_out = (flame_v < NO_FLAME_MARK);
-    int pilot_light_out_notify =
-        pilot_light_out &&
-        (((tick - flame_out_count) * wakeup_time_sec) > NOTIFY_LIMIT);
-
-    // case for pilot light out notification and then subsequent re-light
-    if (!pilot_light_out && flame_out_count != -NOTIFY_LIMIT)
+    // full-burner =~ 14-18, pilot =~ 8-14, off =~ 0-6
+    int last_pilot_light_out = pilot_light_out;
+    int flame_ave = ave_val(&flame_v_ave);
+    if (flame_ave < FLAME_OFF_MARK)
     {
-        // so if the light goes out, wait another 15 minutes
-        flame_out_count = -NOTIFY_LIMIT;
+        pilot_light_out = 1;
     }
+    else if (flame_ave > FLAME_ON_MARK)
+    {
+        pilot_light_out = 0;
+    }
+    int pilot_light_out_notify = pilot_light_out && !last_pilot_light_out;
 
-    // about 3.0v ???
-    const int LOW_BATT_MARK = 1462;
-    int low_battery = ave_val(&batt_v_ave) < LOW_BATT_MARK;
+    // Brownout is ~1360, and the voltage drops quickly from 1775
+    // Ideally notification of low battery should give us at least 24h
+    const int LOW_BATT_MARK = 1775 * FIXED_POINT;
+    // as battery is charging, the value will go up. Once the value hits
+    // 2030 the battery should be considered full and we can send
+    // a message to that effect.
+    const int FULL_BATT_MARK = 2020 * FIXED_POINT;
+    int low_battery = batt_v_ave.value < LOW_BATT_MARK;
     int low_battery_notify =
         low_battery &&
         (((tick - low_bat_count) * wakeup_time_sec) > NOTIFY_LIMIT);
+    int full_battery = batt_v_ave.value > FULL_BATT_MARK;
+    int full_battery_notify =
+        full_battery &&
+        (((tick - low_bat_count) * wakeup_time_sec) > NOTIFY_LIMIT / 2);
 
     // don't bother reporting flame_out or low_batt on first round
     if (tick == 0)
@@ -644,17 +695,17 @@ void app_main(void)
 
     if (pilot_light_out)
     {
-        led_code(RED_LED, 0x55555555);
+        led_code(RED_LED, 0x5555);
     }
     if (low_battery)
     {
-        led_code(GREEN_LED, 0x55555555);
+        led_code(GREEN_LED, 0x5555);
     }
-    if ((tick % 5) == 0 || pilot_light_out_notify)
+    if ((tick % report_tick_interval) == 0 || pilot_light_out_notify)
     {
         init_wifi_power_save();
         // wait for network
-        uint32_t notify_value = flame_to_led(&xEthReadyIndex);
+        uint32_t notify_value = flame_to_led(20, &xEthReadyIndex);
         if (notify_value == 1)
         {
             if (tick == 0)
@@ -662,18 +713,18 @@ void app_main(void)
                 ulog("alert=pilot_light_monitor_reboot");
                 // printf("alert=pilot_light_monitor_reboot\n");
             }
-            char q[128];
-            memset(q, 0, sizeof(q));
+            char q[256];
             // https://UPTIME_HOST/uptime/log?flame_v=702&batt_v=2032
             snprintf(q, sizeof(q) - 1,
-                     "t=%d, flame_v=%d, batt_v=%d, batt_v_ave=%d, heap=%d",
-                     tick, flame_v, batt_v, ave_val(&batt_v_ave),
-                     esp_get_free_heap_size());
+                     "t=%d, f=%d, flame_v=%d, flame_v_ave=%d.%03d, "
+                     "batt_v=%d, batt_v_ave=%d.%03d, heap=%d",
+                     tick, !pilot_light_out, flame_v, ave_whole(&flame_v_ave),
+                     ave_millis(&flame_v_ave), batt_v, ave_whole(&batt_v_ave),
+                     ave_millis(&batt_v_ave), esp_get_free_heap_size());
             ulog(&q[0]);
             // printf("log: %s\n", q);
             if (pilot_light_out_notify)
             {
-                flame_out_count = tick;
                 send_sms(alert_num, "Pilot light is out");
                 // printf("{\"msg\":\"Pilot light is out\"}\n");
             }
@@ -684,7 +735,12 @@ void app_main(void)
                 // printf("{\"msg\":\"Pilot light monitor low
                 // battery\"}\n");
             }
-            if ((tick % 5) == 0)
+            if (full_battery_notify)
+            {
+                low_bat_count = tick;
+                send_sms(alert_num, "Pilot light monitor battery charged");
+            }
+            if ((tick % report_tick_interval) == 0)
             {
                 // send an uptime ping
                 https_get(UPTIME_HOST, "/uptime/pilot_light_ping", NULL);
@@ -697,6 +753,7 @@ void app_main(void)
         }
         wifi_shutdown();
     }
+#if 0
     else
     {
         ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(5 * 1000000));
@@ -707,14 +764,7 @@ void app_main(void)
         uart_wait_tx_idle_polling(CONFIG_ESP_CONSOLE_UART_NUM);
         esp_light_sleep_start();
     }
+#endif
 
-    // All the work is done; go to sleep
-    ESP_LOGI(TAG, "Enabling timer wakeup, %ds\n", wakeup_time_sec);
-    ESP_ERROR_CHECK(esp_sleep_enable_timer_wakeup(wakeup_time_sec * 1000000));
-
-    ESP_LOGI(TAG, "Entering deep sleep\n");
-    gettimeofday(&sleep_enter_time, NULL);
-    uart_wait_tx_idle_polling(CONFIG_ESP_CONSOLE_UART_NUM);
-
-    esp_deep_sleep_start();
+    deep_usleep(wakeup_time_sec * 1000000);
 }
