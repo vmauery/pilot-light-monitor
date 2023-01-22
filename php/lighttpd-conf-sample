@@ -1,0 +1,10 @@
+$HTTP["host"] =~ "the-sample-host.org" {
+    server.document-root = "/var/www/"
+
+    url.rewrite-if-not-file = (
+        # fetch/forward rewrite
+        "^/uptime/([^?]*)[?](.*)$" => "/uptime/index.php?q=$1&$2",
+        "^/uptime/(.*)$" => "/uptime/index.php?q=$1",
+    )
+}
+
