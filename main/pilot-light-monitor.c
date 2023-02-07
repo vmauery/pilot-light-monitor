@@ -32,7 +32,6 @@
 #include <time.h>
 
 #include "nanoprintf.h"
-#include "private-info.h"
 
 const char* TAG = "pilot-light-monitor";
 
@@ -50,9 +49,12 @@ const char* TAG = "pilot-light-monitor";
 #define DEFAULT_PS_MODE WIFI_PS_NONE
 #endif
 
+static const char alert_num[] = CONFIG_PLM_TWILIO_SMS_ALERT;
+#define UPTIME_HOST CONFIG_PLM_UPTIME_HOST
+
 void https_get(const char* host, const char* path, const char* query);
 void https_post(const char* uri, const char* data, const char* type,
-                const char* auth);
+                const char* user, const char* passwd);
 char* urlencode(const char* msg);
 
 void ulog(const char* msg)
@@ -385,14 +387,14 @@ void read_adc(int reps, int light_sleep, int* ch0, int* ch1)
                 v1 += adc_raw;
             }
         }
-        // sleep for 10ms
+        // sleep for 20ms
         if (light_sleep)
         {
-            light_usleep(10000);
+            light_usleep(20000);
         }
         else
         {
-            vTaskDelay(10 / portTICK_PERIOD_MS);
+            vTaskDelay(20 / portTICK_PERIOD_MS);
         }
     }
     if (ch0)
@@ -502,6 +504,7 @@ void send_sms(const char* to, const char* msg)
     {
         return;
     }
+    const char sms_from[] = CONFIG_PLM_TWILIO_SMS_SENDER;
     char* smsg = urlencode(msg);
     const char MSG_FMT[] = "To=%s&From=%s&Body=%s";
     size_t datalen = sizeof(MSG_FMT) + strnlen(smsg, 320) + sizeof(sms_from) +
@@ -511,11 +514,14 @@ void send_sms(const char* to, const char* msg)
     {
         return;
     }
+    const char* user = CONFIG_PLM_TWILIO_SID;
+    const char* passwd = CONFIG_PLM_TWILIO_TOKEN;
     snprintf(data, datalen - 1, MSG_FMT, to, sms_from, smsg);
     free(smsg);
-    https_post("https://api.twilio.com/2010-04-01/Accounts/" SID
-               "/Messages.json",
-               data, "application/x-www-form-urlencoded", basic_auth);
+    https_post(
+        "https://api.twilio.com/2010-04-01/Accounts/" CONFIG_PLM_TWILIO_SID
+        "/Messages.json",
+        data, "application/x-www-form-urlencoded", user, passwd);
     free(data);
 }
 
@@ -575,7 +581,8 @@ int flame_to_led(int timeout, const UBaseType_t* wait_on)
         for (int j = 0; j < 20; j++)
         {
             read_adc(5, 0, &flame_v, NULL);
-            int duty = MIN(flame_v / 28, 100) * 10;
+            // flame only goes to 15 max
+            int duty = MAX(1000, MIN(flame_v, 15) * 67); // 0-1000
             //    printf("flame_v = %d, duty = %d.%d\n", flame_v, duty / 10,
             //           duty % 10);
             set_led_duty(RED_LED, duty);
@@ -601,10 +608,10 @@ void app_main(void)
     // wakeup_time_sec * report_tick_interval seconds
     // Ideally this would be every 30 minutes
 
-    // for debugging, 20 is nice, but 60 is better for the battery
-    const int wakeup_time_sec = 20;
-    // for debugging, 5 is nice, but 30 is better for the battery
-    const int report_tick_interval = 5;
+    // for debugging, 20 is nice, but 120 is better for the battery
+    const int wakeup_time_sec = 120;
+    // for debugging, 5 is nice, but 15 is better for the battery
+    const int report_tick_interval = 15;
 
     // get task ID for notifications
     xMainTask = xTaskGetCurrentTaskHandle();
@@ -652,7 +659,7 @@ void app_main(void)
     int flame_v = 0;
     int batt_v = 0;
     // monitor the flame for a full second, with light sleep enabled
-    read_adc(100, 1, &flame_v, &batt_v);
+    read_adc(50, 1, &flame_v, &batt_v);
     ave_new_value_limited(&flame_v_ave, flame_v);
     ave_new_value_limited(&batt_v_ave, batt_v);
     ESP_LOGI(TAG, "read_adc -> flame_v = %d, batt_v = %d (%d)\n", flame_v,

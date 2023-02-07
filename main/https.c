@@ -81,8 +81,10 @@ esp_err_t _http_event_handler(esp_http_client_event_t* evt)
     return ESP_OK;
 }
 
+char* basic_auth(const char* user, const char* passwd);
+
 void https_post(const char* uri, const char* data, const char* content_type,
-                const char* auth)
+                const char* user, const char* passwd)
 {
     esp_http_client_config_t config = {
         .url = uri,
@@ -96,9 +98,11 @@ void https_post(const char* uri, const char* data, const char* content_type,
     esp_http_client_set_method(client, HTTP_METHOD_POST);
     esp_http_client_set_post_field(client, data, strlen(data));
     esp_http_client_set_header(client, "Content-type", content_type);
-    if (auth)
+    if (user || passwd)
     {
+        char* auth = basic_auth(user, passwd);
         esp_http_client_set_header(client, "Authorization", auth);
+        free(auth);
     }
     while (1)
     {

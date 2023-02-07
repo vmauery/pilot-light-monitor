@@ -1,5 +1,36 @@
 menu "Pilot Light Monitor Configuration"
 
+    config PLM_TWILIO_SID
+        string "Twilio SID"
+        default "YOUR-TWILIO-SID"
+        help
+            Twilio SID (get this from your Twilio account)
+
+    config PLM_TWILIO_TOKEN
+        string "Twilio Token"
+        default "YOUR-TWILIO-TOKEN"
+        help
+            Twilio TOKEN (get this from your Twilio account)
+
+    config PLM_TWILIO_SMS_SENDER
+        string "The Twilio sender phone number"
+        default "+15035551212"
+        help
+            Twilio SMS Sender (get this from your Twilio account)
+
+    config PLM_TWILIO_SMS_ALERT
+        string "The SMS receiver phone number"
+        default "+15035552323"
+        help
+            What phone number to send a text to for alerts
+
+    config PLM_UPTIME_HOST
+        string "The uptime host to send logs and watchdog uptime messages to"
+        default "https://www.bitbucket.com"
+        help
+            The host that is running the uptime PHP code that accompanies
+            this firmware code.
+
     config PLM_WIFI_SSID
         string "WiFi SSID"
         default "myssid"
