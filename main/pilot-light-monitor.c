@@ -82,9 +82,6 @@ void deep_usleep(uint64_t us)
     esp_deep_sleep_start();
 }
 
-const int FLAME_OFF_MARK = 6;
-const int FLAME_ON_MARK = 8;
-
 #define RED_LED GPIO_NUM_6
 #define GREEN_LED GPIO_NUM_7
 
@@ -92,7 +89,6 @@ const int FLAME_ON_MARK = 8;
 struct windowed_ave
 {
     int value;
-    int count;
     int window;
 };
 
@@ -459,26 +455,21 @@ void register_timer_wakeup(void)
 
 void windowed_ave_init(struct windowed_ave* a, int window)
 {
-    a->count = 0;
-    a->value = 0;
+    a->value = -1;
     a->window = window;
 }
 
-void ave_new_value_limited(struct windowed_ave* a, int val)
+void ave_new_value(struct windowed_ave* a, int val)
 {
-    int prev_count = (a->count == a->window) ? (a->window - 1) : a->count;
-    a->count = prev_count + 1;
     val *= FIXED_POINT;
-    int delta = val - a->value;
-    int sign = delta >= 0 ? 1 : -1;
-    delta = abs(delta);
-    int ok_delta = abs(a->value / (a->window / 2));
-    if ((a->count == a->window) && (delta > ok_delta))
+    if (a->value == -1)
     {
-        // allow the growth to happen slowly
-        val = a->value + sign * ok_delta;
+        a->value = val;
     }
-    a->value = (prev_count * a->value + val) / a->count;
+    else
+    {
+        a->value = ((a->window - 1) * a->value + val) / a->window;
+    }
 }
 // return the closest integer to the average
 int ave_val(struct windowed_ave* a)
@@ -570,10 +561,28 @@ void set_led_duty(int led, int duty)
     ledc_update_duty(LEDC_MODE, led_to_channel[led]);
 }
 
+// full-burner =~ 14-18, pilot =~ 8-14, off =~ 0-6
+const int FLAME_OFF_MARK = 6 * FIXED_POINT;
+const int FLAME_ON_MARK = 8 * FIXED_POINT;
+
+// Brownout is ~1360, and the voltage drops quickly from 1775
+// Ideally notification of low battery should give us at least 24h
+const int LOW_BATT_MARK = 1775 * FIXED_POINT;
+const int DEAD_BATT_MARK = 1600 * FIXED_POINT;
+// as battery is charging, the value will go up. Once the value hits
+// 2028 the battery should be considered full and we can send
+// a message to that effect.
+// TODO: ideally, since the battery marks and battery percentages are
+//       specific to the battery itself, the values ought to be in
+//       a config rather than the code itself.
+const int FULL_BATT_MARK = 2028 * FIXED_POINT;
+
 // timeout is approximately seconds, wait on is a notify identifier
 int flame_to_led(int timeout, const UBaseType_t* wait_on)
 {
+    struct windowed_ave f_v_ave;
     int flame_v = 0;
+    windowed_ave_init(&f_v_ave, 8);
     ledc_pwm_init(RED_LED);
     int finder_timeout = timeout;
     while (--finder_timeout)
@@ -581,6 +590,7 @@ int flame_to_led(int timeout, const UBaseType_t* wait_on)
         for (int j = 0; j < 20; j++)
         {
             read_adc(5, 0, &flame_v, NULL);
+            ave_new_value(&f_v_ave, flame_v);
             // flame only goes to 15 max
             int duty = MAX(1000, MIN(flame_v, 15) * 67); // 0-1000
             //    printf("flame_v = %d, duty = %d.%d\n", flame_v, duty / 10,
@@ -595,10 +605,73 @@ int flame_to_led(int timeout, const UBaseType_t* wait_on)
             }
         }
     }
-    ledc_pwm_fini(RED_LED, (flame_v > FLAME_OFF_MARK) ? 0 : 1);
+    ledc_pwm_fini(RED_LED, (f_v_ave.value > FLAME_OFF_MARK) ? 0 : 1);
 
     // return 1 for did not timeout, 0 for did timeout
     return finder_timeout ? 1 : 0;
+}
+
+int batt_v_to_percent(int batt_v)
+{
+    // voltages in microvolts (raw fixed-point millivolts)
+    // from past runs, profiling *my* battery, with the current
+    // values of the resistors for the voltage divider.... YMMV
+    //
+    // to get the actual mv value, divide each of these by <FIXED_POINT>
+    static const int v_to_p[] = {
+        1644742, 1705632, 1745612, 1774704, 1797665, 1810827, 1817679, 1818688,
+        1819885, 1821121, 1824247, 1827053, 1828373, 1829807, 1832540, 1836892,
+        1839972, 1841061, 1842425, 1843682, 1847036, 1849721, 1851523, 1853364,
+        1854369, 1855122, 1856320, 1859470, 1862010, 1864060, 1864767, 1865630,
+        1867623, 1871172, 1871765, 1873285, 1875043, 1875307, 1875891, 1876331,
+        1877091, 1877117, 1877865, 1877990, 1878867, 1881712, 1884357, 1886186,
+        1886489, 1887177, 1887222, 1887785, 1888227, 1892516, 1893377, 1895929,
+        1897283, 1897978, 1899619, 1900395, 1905624, 1907439, 1909017, 1909756,
+        1911879, 1917119, 1920542, 1923474, 1930071, 1932571, 1935746, 1941364,
+        1943468, 1944712, 1946792, 1952251, 1954940, 1955883, 1957980, 1963820,
+        1964966, 1966812, 1968677, 1972557, 1976820, 1978592, 1984149, 1988391,
+        1993468, 2000708, 2005510, 2011060, 2015878, 2021597, 2026503, 2032806,
+        2036732, 2045131, 2053061, 2068006, 2077208,
+    };
+    int l = 0;
+    const int max_p = (int)(sizeof(v_to_p) / sizeof(v_to_p[0])) - 1;
+    int h = max_p;
+    int c = 0;
+    if (batt_v < v_to_p[l])
+    {
+        return l;
+    }
+    if (batt_v > v_to_p[h])
+    {
+        return h;
+    }
+    while (l != h)
+    {
+        int m = (l + h) / 2;
+        if (l == m)
+        {
+            break;
+        }
+        if (batt_v == v_to_p[m])
+        {
+            return m;
+        }
+        if (batt_v > v_to_p[m])
+        {
+            l = m;
+        }
+        else
+        {
+            h = m;
+        }
+        // this should never happen, but can't afford infinite loops
+        // log2(101) =~ 6.66, so never more than 7 loops
+        if (c++ > 7)
+        {
+            break;
+        }
+    }
+    return l;
 }
 
 void app_main(void)
@@ -660,30 +733,27 @@ void app_main(void)
     int batt_v = 0;
     // monitor the flame for a full second, with light sleep enabled
     read_adc(50, 1, &flame_v, &batt_v);
-    ave_new_value_limited(&flame_v_ave, flame_v);
-    ave_new_value_limited(&batt_v_ave, batt_v);
+    ave_new_value(&flame_v_ave, flame_v);
+    ave_new_value(&batt_v_ave, batt_v);
     ESP_LOGI(TAG, "read_adc -> flame_v = %d, batt_v = %d (%d)\n", flame_v,
              batt_v, ave_val(&batt_v_ave));
-    // full-burner =~ 14-18, pilot =~ 8-14, off =~ 0-6
     int last_pilot_light_out = pilot_light_out;
-    int flame_ave = ave_val(&flame_v_ave);
-    if (flame_ave < FLAME_OFF_MARK)
+    if (flame_v_ave.value < FLAME_OFF_MARK)
     {
         pilot_light_out = 1;
     }
-    else if (flame_ave > FLAME_ON_MARK)
+    else if (flame_v_ave.value > FLAME_ON_MARK)
     {
         pilot_light_out = 0;
     }
     int pilot_light_out_notify = pilot_light_out && !last_pilot_light_out;
 
-    // Brownout is ~1360, and the voltage drops quickly from 1775
-    // Ideally notification of low battery should give us at least 24h
-    const int LOW_BATT_MARK = 1775 * FIXED_POINT;
-    // as battery is charging, the value will go up. Once the value hits
-    // 2030 the battery should be considered full and we can send
-    // a message to that effect.
-    const int FULL_BATT_MARK = 2020 * FIXED_POINT;
+    if (batt_v_ave.value < DEAD_BATT_MARK)
+    {
+        // sleep for 5 whole report cycles; enough to trigger
+        // a pilot light is dead watchdog
+        deep_usleep(1000000ul * 5 * wakeup_time_sec * report_tick_interval);
+    }
     int low_battery = batt_v_ave.value < LOW_BATT_MARK;
     int low_battery_notify =
         low_battery &&
@@ -723,24 +793,25 @@ void app_main(void)
             char q[256];
             // https://UPTIME_HOST/uptime/log?flame_v=702&batt_v=2032
             snprintf(q, sizeof(q) - 1,
-                     "t=%d, f=%d, flame_v=%d, flame_v_ave=%d.%03d, "
-                     "batt_v=%d, batt_v_ave=%d.%03d, heap=%d",
-                     tick, !pilot_light_out, flame_v, ave_whole(&flame_v_ave),
-                     ave_millis(&flame_v_ave), batt_v, ave_whole(&batt_v_ave),
-                     ave_millis(&batt_v_ave), esp_get_free_heap_size());
-            ulog(&q[0]);
+                     "t=%d, flame_v=%d, flame_v_ave=%d.%03d, "
+                     "batt_p=%d, batt_v_ave=%d.%03d, heap=%d",
+                     tick, flame_v, ave_whole(&flame_v_ave),
+                     ave_millis(&flame_v_ave),
+                     batt_v_to_percent(batt_v_ave.value),
+                     ave_whole(&batt_v_ave), ave_millis(&batt_v_ave),
+                     esp_get_free_heap_size());
             // printf("log: %s\n", q);
+            ulog(&q[0]);
             if (pilot_light_out_notify)
             {
+                // printf("SMS: Pilot light is out\n");
                 send_sms(alert_num, "Pilot light is out");
-                // printf("{\"msg\":\"Pilot light is out\"}\n");
             }
             if (low_battery_notify)
             {
                 low_bat_count = tick;
+                // printf("SMS: Pilot light monitor low battery\n");
                 send_sms(alert_num, "Pilot light monitor low battery");
-                // printf("{\"msg\":\"Pilot light monitor low
-                // battery\"}\n");
             }
             if (full_battery_notify)
             {
@@ -750,8 +821,8 @@ void app_main(void)
             if ((tick % report_tick_interval) == 0)
             {
                 // send an uptime ping
-                https_get(UPTIME_HOST, "/uptime/pilot_light_ping", NULL);
                 // printf("%s%s\n", UPTIME_HOST, "/uptime/pilot_light_ping");
+                https_get(UPTIME_HOST, "/uptime/pilot_light_ping", NULL);
             }
         }
         else
